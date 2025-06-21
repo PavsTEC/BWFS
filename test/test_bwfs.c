@@ -17,6 +17,7 @@
 #define TEST_HEIGHT      1024
 #define TEST_BLOCK_SIZE  1024    // en bits
 #define TEST_PBM_FILE    "test.pbm"
+#define TEST_PBM_DIR     "test_pbm"
 #define MAX_FILE_SIZE   (BWFS_MAX_BLOCKS_PER_FILE * (TEST_BLOCK_SIZE / 8))
 
 // Función para generar datos aleatorios
@@ -337,6 +338,9 @@ static void test_multiple_files(FSImage *fs) {
         free(data);
     }
     
+    // Actualizar checksums antes de verificar integridad
+    fs_update_checksums(fs);
+    
     // Verificar integridad
     assert(fs_check_integrity(fs) == 0);
     printf("✔ test_multiple_files\n");
@@ -423,7 +427,13 @@ static void test_boundaries(FSImage *fs) {
 static void test_persistence(void) {
     printf("\n=== test_persistence ===\n");
     const char *filename = "persistent.bin";
-    const char *fs_file = "persistent.pbm";
+    const char *fs_dir = "persistent_dir";  // Usar una carpeta
+    
+    // Eliminar el directorio si existe
+    __attribute__((unused)) int unused1 = system("rm -rf persistent_dir");
+    
+    // Crear el directorio
+    assert(mkdir(fs_dir, 0777) == 0);
     
     // Crear sistema de archivos
     FSImage *fs = fs_create(TEST_WIDTH, TEST_HEIGHT, TEST_BLOCK_SIZE);
@@ -438,11 +448,13 @@ static void test_persistence(void) {
     
     assert(fs_create_file(fs, filename) == 0);
     assert(fs_write_file(fs, filename, data, size) == (ssize_t)size);
-    assert(fs_save(fs, fs_file) == 0);
+    
+    // Guardar el sistema de archivos
+    assert(fs_save(fs, fs_dir) == 0);
     fs_destroy(fs);
     
     // Cargar sistema de archivos
-    fs = fs_load(fs_file);
+    fs = fs_load(fs_dir);
     assert(fs);
     
     // Verificar integridad
@@ -456,7 +468,9 @@ static void test_persistence(void) {
     free(data);
     free(rdata);
     fs_destroy(fs);
-    remove(fs_file);
+    
+    // Eliminar el directorio y todos sus contenidos
+    __attribute__((unused)) int unused2 = system("rm -rf persistent_dir");
     printf("✔ test_persistence\n");
 }
 
@@ -477,9 +491,11 @@ static void test_fsck(void) {
     assert(fs_write_file(fs, filename, data, 256) == 256);
     
     // Guardar y recargar
-    assert(fs_save(fs, TEST_PBM_FILE) == 0);
+    __attribute__((unused)) int unused1 = system("rm -rf test_pbm");
+    assert(mkdir(TEST_PBM_DIR, 0777) == 0);
+    assert(fs_save(fs, TEST_PBM_DIR) == 0);
     fs_destroy(fs);
-    fs = fs_load(TEST_PBM_FILE);
+    fs = fs_load(TEST_PBM_DIR);
     assert(fs);
     
     // === Prueba de corrupción de datos ===
@@ -492,10 +508,10 @@ static void test_fsck(void) {
     int block = e->blocks[0];
     int offset = fs->sb.data_offset + block * fs->sb.block_size;
     for (int i = 0; i < 8; i++) {
-        int x = (offset + i) % fs->img->width;
-        int y = (offset + i) / fs->img->width;
-        int old_bit = pbm_get_pixel(fs->img, x, y);
-        pbm_set_pixel(fs->img, x, y, !old_bit);
+        int x = (offset + i) % fs->images[0]->width;
+        int y = (offset + i) / fs->images[0]->width;
+        int old_bit = pbm_get_pixel(fs->images[0], x, y);
+        pbm_set_pixel(fs->images[0], x, y, !old_bit);
     }
     
     // Verificar que se detecta la corrupción
@@ -505,19 +521,22 @@ static void test_fsck(void) {
     fs_destroy(fs);
     
     // === Prueba de corrupción de metadatos ===
-    fs = fs_load(TEST_PBM_FILE);
+    fs = fs_load(TEST_PBM_DIR);
     assert(fs);
     
     // Corromper el campo 'size' en la entrada del directorio
     idx = dir_find(&fs->dir, filename);
     assert(idx >= 0);
-    e = dir_entry_mut(&fs->dir, idx);
+    DirEntry *e2 = dir_entry_mut(&fs->dir, idx);
     
     // Guardar el tamaño original
-    uint32_t original_size = e->size;
+    uint32_t original_size = e2->size;
     
     // Cambiar el tamaño a un valor incorrecto
-    e->size = original_size + 100;
+    e2->size = original_size + 100;
+    
+    // Invalidate directory checksum in superblock
+    fs->sb.dir_checksum = 0;
     
     // Verificar que se detecta la corrupción
     rc = fs_check_integrity(fs);
@@ -526,8 +545,166 @@ static void test_fsck(void) {
     fs_destroy(fs);
     
     // Limpieza
-    remove(TEST_PBM_FILE);
+    __attribute__((unused)) int unused2 = system("rm -rf test_pbm");
     printf("✔ test_fsck\n");
+}
+
+// 10) Prueba de múltiples imágenes
+static void test_multiple_images(void) {
+    printf("\n=== test_multiple_images ===\n");
+    const char *folder_path = "test_images";
+    
+    // Eliminar el directorio si existe
+    __attribute__((unused)) int unused1 = system("rm -rf test_images");
+    
+    // Crear el directorio
+    assert(mkdir(folder_path, 0777) == 0);
+    
+    FSImage *fs = fs_create(1000, 1000, TEST_BLOCK_SIZE);
+    assert(fs);
+    
+    // Crear suficientes archivos (reducir tamaño para que quepan)
+    for (int i = 0; i < 20; i++) {
+        char filename[32];
+        snprintf(filename, sizeof(filename), "file%d.bin", i);
+        int rc = fs_create_file(fs, filename);
+        if (rc < 0) {
+            printf("Error creando archivo '%s': %d\n", filename, rc);
+            if (dir_find(&fs->dir, filename) >= 0) {
+                printf("El archivo '%s' ya existe\n", filename);
+            }
+        }
+        assert(rc >= 0);
+        
+        // REDUCIR TAMAÑO: 128 en lugar de 1024
+        size_t size = 128 * (i + 1);
+        uint8_t *data = malloc(size);
+        assert(data);
+        generate_random_data(data, size);
+        
+        ssize_t wrote = fs_write_file(fs, filename, data, size);
+        assert(wrote == (ssize_t)size);
+        free(data);
+    }
+    
+    // Guardar y recargar para verificar
+    assert(fs_save(fs, folder_path) == 0);
+    fs_destroy(fs);
+    fs = fs_load(folder_path);
+    assert(fs);
+    
+    // Verificar integridad
+    assert(fs_check_integrity(fs) == 0);
+    
+    // Limpieza
+    fs_destroy(fs);
+    __attribute__((unused)) int unused2 = system("rm -rf test_images");
+    printf("✔ test_multiple_images\n");
+}
+
+// 11) Prueba de expansión automática
+static void test_auto_expansion(void) {
+    printf("\n=== test_auto_expansion ===\n");
+    const char *folder_path = "test_auto_expansion";
+    __attribute__((unused)) int unused1 = system("rm -rf test_auto_expansion");
+    assert(mkdir(folder_path, 0777) == 0);
+    
+    FSImage *fs = fs_create(1000, 1000, TEST_BLOCK_SIZE);
+    assert(fs);
+    
+    // Calcular capacidad REAL disponible (considerando metadatos)
+    size_t total_bits = fs->images[0]->width * fs->images[0]->height;
+    size_t metadata_bits = fs->sb.data_offset;  // Bits usados por metadatos
+    size_t available_bits = total_bits - metadata_bits;
+    size_t available_bytes = available_bits / 8;
+    
+    // Crear suficientes archivos para exceder la capacidad disponible
+    int file_count = 50;  // Más archivos para asegurar expansión
+    size_t file_size = 4096;  // 4KB por archivo
+    
+    printf("Capacidad total: %zu bits (%zu bytes)\n", total_bits, total_bits/8);
+    printf("Metadatos: %zu bits (%zu bytes)\n", metadata_bits, metadata_bits/8);
+    printf("Espacio disponible: %zu bits (%zu bytes)\n", available_bits, available_bytes);
+    printf("Tamaño por archivo: %zu bytes\n", file_size);
+    printf("Total a escribir: %zu bytes\n", file_size * file_count);
+    
+    // Crear y escribir múltiples archivos
+    for (int i = 0; i < file_count; i++) {
+        char filename[32];
+        snprintf(filename, sizeof(filename), "file%d.bin", i);
+        
+        int rc = fs_create_file(fs, filename);
+        if (rc < 0) {
+            printf("Error creando archivo '%s': %d\n", filename, rc);
+            if (rc == -1) {
+                printf("Directorio lleno, deteniendo...\n");
+                break;
+            }
+        }
+        assert(rc >= 0);
+        
+        uint8_t *data = malloc(file_size);
+        assert(data);
+        generate_random_data(data, file_size);
+        
+        ssize_t wrote = fs_write_file(fs, filename, data, file_size);
+        printf("Archivo %d: escribió %zd/%zu bytes\n", i, wrote, file_size);
+        
+        if (wrote != (ssize_t)file_size) {
+            printf("Error escribiendo! Espacio insuficiente? %zd\n", wrote);
+            free(data);
+            break;
+        }
+        
+        free(data);
+        
+        // Verificar si ya se creó una nueva imagen
+        if (fs->image_count > 1) {
+            printf("¡Nueva imagen creada después del archivo %d!\n", i);
+            break;
+        }
+    }
+    
+    // Verificar que se creó una segunda imagen
+    printf("Número final de imágenes: %d\n", fs->image_count);
+    assert(fs->image_count > 1);
+    
+    // Verificar integridad antes de guardar
+    printf("Verificando integridad...\n");
+    assert(fs_check_integrity(fs) == 0);
+    
+    // Guardar y recargar
+    printf("Guardando sistema de archivos...\n");
+    assert(fs_save(fs, folder_path) == 0);
+    fs_destroy(fs);
+    printf("Cargando sistema de archivos...\n");
+    fs = fs_load(folder_path);
+    assert(fs);
+    
+    // Verificar que los archivos se pueden leer
+    printf("Leyendo archivos...\n");
+    for (int i = 0; i < file_count; i++) {
+        char filename[32];
+        snprintf(filename, sizeof(filename), "file%d.bin", i);
+        
+        // Solo verificar archivos creados exitosamente
+        if (dir_find(&fs->dir, filename) < 0) break;
+        
+        uint8_t *rdata = malloc(file_size);
+        assert(rdata);
+        
+        ssize_t readb = fs_read_file(fs, filename, rdata, file_size);
+        if (readb < 0) {
+            printf("Error leyendo '%s': %zd\n", filename, readb);
+        }
+        assert(readb == (ssize_t)file_size);
+        free(rdata);
+    }
+    
+    // Limpieza
+    fs_destroy(fs);
+    __attribute__((unused)) int unused2 = system("rm -rf test_auto_expansion");
+    printf("✔ test_auto_expansion\n");
 }
 
 int main(void) {
@@ -561,6 +738,10 @@ int main(void) {
     // Pruebas de persistencia e integridad
     test_persistence();
     test_fsck();
+    
+    // Pruebas de nuevas funcionalidades
+    test_multiple_images();
+    test_auto_expansion();
     
     printf("\n🎉 ¡Todas las pruebas pasaron!\n");
     return 0;

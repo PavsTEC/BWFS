@@ -1,23 +1,27 @@
 #ifndef FS_IMAGE_H
 #define FS_IMAGE_H
 
-#include <sys/types.h>  // Para ssize_t
+#include <sys/types.h>
 #include "pbm_manager.h"
 #include "superblock.h"
 #include "block_manager.h"
 #include "directory.h"
 
-// Eliminamos las redefiniciones y usamos las de superblock/directory
+#define BWFS_SIGNATURE 0x12345678  // Nuevo valor para la firma de la imagen inicial
+
 typedef struct {
-    PBMImage *img;
+    PBMImage **images; // Lista de imágenes PBM
+    int image_count;   // Número de imágenes
     Superblock sb;
     BlockManager bm;
     Directory dir;
 } FSImage;
 
 FSImage *fs_create(int width, int height, int block_size);
-FSImage *fs_load(const char *path);
-int fs_save(FSImage *fs, const char *path);
+FSImage *fs_load(const char *folder_path);
+
+void fs_update_checksums(FSImage *fs);
+int fs_save(FSImage *fs, const char *folder_path);
 void fs_destroy(FSImage *fs);
 int fs_create_file(FSImage *fs, const char *name);
 int fs_remove_file(FSImage *fs, const char *name);

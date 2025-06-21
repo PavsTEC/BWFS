@@ -1,52 +1,28 @@
 #ifndef FS_IMAGE_H
 #define FS_IMAGE_H
 
+#include <sys/types.h>  // Para ssize_t
 #include "pbm_manager.h"
-#include "block_manager.h"
 #include "superblock.h"
+#include "block_manager.h"
+#include "directory.h"
 
+// Eliminamos las redefiniciones y usamos las de superblock/directory
 typedef struct {
-    PBMImage      **images;            // Array de segmentos
-    BlockManager  **bms;               // BlockManagers por segmento
-    Superblock     *sb;                // Superbloque en memoria
-    int             segment_count;     // Nº de segmentos
-    int             blocks_per_segment;// Bloques por segmento
-    int             total_blocks;      // Bloques totales
+    PBMImage *img;
+    Superblock sb;
+    BlockManager bm;
+    Directory dir;
 } FSImage;
 
-/**
- * Crea un FS nuevo en memoria.
- * - segment_count: cuántos segmentos
- * - width, height: tamaño de cada PBM
- * - block_size: bytes por bloque
- * - passphrase: si no está vacía, persiste y luego carga el SB
- */
-FSImage *fs_create(int segment_count,
-                   int width,
-                   int height,
-                   int block_size,
-                   const char *passphrase);
+FSImage *fs_create(int width, int height, int block_size);
+FSImage *fs_load(const char *path);
+int fs_save(FSImage *fs, const char *path);
+void fs_destroy(FSImage *fs);
+int fs_create_file(FSImage *fs, const char *name);
+int fs_remove_file(FSImage *fs, const char *name);
+ssize_t fs_write_file(FSImage *fs, const char *name, const void *buf, size_t count);
+ssize_t fs_read_file(FSImage *fs, const char *name, void *buf, size_t count);
+int fs_check_integrity(FSImage *fs);
 
-/**
- * Carga un FS existente desde archivos PBM.
- * - paths: array de rutas a los PBM
- * - segment_count: cuántos paths hay
- * - passphrase: para descifrar superbloque
- */
-FSImage *fs_load(const char * const *paths,
-                 int segment_count,
-                 const char *passphrase);
-
-/** Destruye el FS y libera recursos. */
-int fs_destroy(FSImage *fs);
-
-/** Reserva el siguiente bloque libre global. */
-int fs_alloc_block(FSImage *fs);
-
-/** Libera un bloque global. */
-int fs_free_block(FSImage *fs, int block_id);
-
-/** Consulta si un bloque global está ocupado. */
-int fs_is_allocated(FSImage *fs, int block_id);
-
-#endif // FS_IMAGE_H
+#endif

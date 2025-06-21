@@ -1,69 +1,63 @@
 #include "superblock.h"
 #include "pbm_manager.h"
-#include <stdlib.h>
-#include <stdint.h>
+#include <string.h>
+#include "directory.h"
 
-// Guarda el superbloque bit a bit en los últimos sizeof(Superblock)*8 píxeles
-int sb_save(PBMImage *image, const Superblock *sb, const char *passphrase) {
-    (void)passphrase;  // No usamos cifrado en este ejemplo
-    if (!image || !sb) return -1;
+uint32_t sb_checksum(const Superblock *sb) {
+    const uint32_t *arr = (const uint32_t *)sb;
+    uint32_t sum = 0;
+    // Todos los campos excepto el último (checksum)
+    for (size_t i = 0; i < (sizeof(Superblock)/sizeof(uint32_t)) - 1; ++i)
+        sum ^= arr[i] + (uint32_t)i;  // Mejoramos el checksum
+    return sum;
+}
 
-    int width    = image->width;
-    int height   = image->height;
-    int capacity = width * height;
-    int sb_bytes = sizeof(Superblock);
-    int required = sb_bytes * 8;  // 8 píxeles por byte
+void sb_init(Superblock *sb, int width, int height, int block_size,
+             int block_count, int max_files, int max_blocks_per_file) {
+    memset(sb, 0, sizeof(*sb));
+    sb->magic               = BWFS_MAGIC;
+    sb->width               = width;
+    sb->height              = height;
+    sb->block_size          = block_size;
+    sb->block_count         = block_count;
+    sb->max_files           = max_files;
+    sb->max_blocks_per_file = max_blocks_per_file;
+    
+    // Calculamos los offsets correctamente
+    size_t s_bits = sizeof(Superblock) * 8;
+    size_t d_bits = max_files * sizeof(DirEntry) * 8;
+    
+    sb->bitmap_offset = s_bits;
+    sb->dir_offset    = s_bits + block_count; // bitmap = 1 bit por bloque
+    sb->data_offset   = s_bits + block_count + d_bits;
+    
+    sb->checksum      = sb_checksum(sb);
+}
 
-    if (capacity < required) return -1;
-
-    const uint8_t *data = (const uint8_t*)sb;
-    // Base al final de la imagen
-    int base = capacity - required;
-    for (int i = 0; i < sb_bytes; i++) {
-        uint8_t byte = data[i];
-        for (int bit = 0; bit < 8; bit++) {
-            int pix_idx = base + i * 8 + bit;
-            int x = pix_idx % width;
-            int y = pix_idx / width;
-            int v = (byte >> bit) & 1;
-            pbm_set_pixel(image, x, y, v);
+int sb_save(const Superblock *sb, PBMImage *img) {
+    if (!sb || !img) return -1;
+    const uint8_t *bytes = (const uint8_t*)sb;
+    for (size_t b = 0; b < sizeof(Superblock); ++b) {
+        for (int bit = 0; bit < 8; ++bit) {
+            int value = (bytes[b] >> (7 - bit)) & 1;
+            pbm_set_pixel(img, (b*8 + bit) % img->width, (b*8 + bit) / img->width, value);
         }
     }
     return 0;
 }
 
-// Carga el superbloque leyendo bit a bit de los últimos sizeof(Superblock)*8 píxeles
-Superblock *sb_load(PBMImage *image, const char *passphrase) {
-    (void)passphrase;
-    if (!image) return NULL;
-
-    int width    = image->width;
-    int height   = image->height;
-    int capacity = width * height;
-    int sb_bytes = sizeof(Superblock);
-    int required = sb_bytes * 8;
-
-    if (capacity < required) return NULL;
-
-    Superblock *sb = malloc(sizeof(Superblock));
-    if (!sb) return NULL;
-
-    uint8_t *data = (uint8_t*)sb;
-    int base = capacity - required;
-    for (int i = 0; i < sb_bytes; i++) {
-        uint8_t byte = 0;
-        for (int bit = 0; bit < 8; bit++) {
-            int pix_idx = base + i * 8 + bit;
-            int x = pix_idx % width;
-            int y = pix_idx / width;
-            int v = pbm_get_pixel(image, x, y);
-            if (v) byte |= (1 << bit);
+int sb_load(Superblock *sb, const PBMImage *img) {
+    if (!sb || !img) return -1;
+    uint8_t *bytes = (uint8_t*)sb;
+    for (size_t b = 0; b < sizeof(Superblock); ++b) {
+        bytes[b] = 0;
+        for (int bit = 0; bit < 8; ++bit) {
+            int value = pbm_get_pixel(img, (b*8 + bit) % img->width, (b*8 + bit) / img->width);
+            if (value < 0) return -1;
+            bytes[b] |= (value << (7 - bit));
         }
-        data[i] = byte;
     }
-    return sb;
-}
-
-void sb_free(Superblock *sb) {
-    free(sb);
+    if (sb->magic != BWFS_MAGIC || sb_checksum(sb) != sb->checksum)
+        return -2;
+    return 0;
 }

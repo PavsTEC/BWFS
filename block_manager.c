@@ -1,56 +1,55 @@
 #include "block_manager.h"
-#include <stdlib.h>  // malloc, free, NULL
+#include <string.h>
 
-// Convierte un índice de bloque en coordenadas de píxel (x,y)
-static void block_to_coord(const BlockManager *bm, int block_index, int *out_x, int *out_y) {
-    long pixel_index = (long)block_index * bm->pixels_per_block;
-    *out_y = pixel_index / bm->image->width;
-    *out_x = pixel_index % bm->image->width;
+void bm_init(BlockManager *bm, PBMImage *img, int offset_bit, int block_count) {
+    if (!img || block_count <= 0 || offset_bit < 0) return;
+    bm->img = img;
+    bm->offset_bit = offset_bit;
+    bm->block_count = block_count;
 }
 
-BlockManager *bm_init(PBMImage *image, int block_size) {
-    if (image == NULL || block_size <= 0) return NULL;
-    BlockManager *bm = malloc(sizeof(BlockManager));
-    if (bm == NULL) return NULL;
-    bm->image = image;
-    bm->block_size = block_size;
-    bm->pixels_per_block = block_size;
-    bm->total_blocks = (image->width * image->height) / bm->pixels_per_block;
-    return bm;
+int bm_alloc(BlockManager *bm, int block_idx) {
+    if (!bm || block_idx < 0 || block_idx >= bm->block_count) return -1;
+    int bitpos = bm->offset_bit + block_idx;
+    int byte_offset = bitpos / 8;
+    int bit_offset = 7 - (bitpos % 8);
+    bm->img->bits[byte_offset] |= (1 << bit_offset);
+    return 0;
 }
 
-void bm_destroy(BlockManager *bm) {
-    free(bm);
+int bm_free(BlockManager *bm, int block_idx) {
+    if (!bm || block_idx < 0 || block_idx >= bm->block_count) return -1;
+    int bitpos = bm->offset_bit + block_idx;
+    int byte_offset = bitpos / 8;
+    int bit_offset = 7 - (bitpos % 8);
+    bm->img->bits[byte_offset] &= ~(1 << bit_offset);
+    return 0;
 }
 
-int bm_alloc(BlockManager *bm) {
-    if (bm == NULL) return -1;
-    for (int i = 0; i < bm->total_blocks; i++) {
-        int x, y;
-        block_to_coord(bm, i, &x, &y);
-        if (pbm_get_pixel(bm->image, x, y) == 0) {
-            pbm_set_pixel(bm->image, x, y, 1);
+int bm_is_allocated(const BlockManager *bm, int block_idx) {
+    if (!bm || block_idx < 0 || block_idx >= bm->block_count) return -1;
+    int bitpos = bm->offset_bit + block_idx;
+    int byte_offset = bitpos / 8;
+    int bit_offset = 7 - (bitpos % 8);
+    return (bm->img->bits[byte_offset] >> bit_offset) & 1;
+}
+
+int bm_alloc_first(BlockManager *bm) {
+    for (int i = 0; i < bm->block_count; ++i) {
+        if (bm_is_allocated(bm, i) == 0) {
+            bm_alloc(bm, i);
             return i;
         }
     }
     return -1;
 }
 
-int bm_free(BlockManager *bm, int block_index) {
-    if (bm == NULL ||
-        block_index < 0 ||
-        block_index >= bm->total_blocks) return -1;
-    int x, y;
-    block_to_coord(bm, block_index, &x, &y);
-    pbm_set_pixel(bm->image, x, y, 0);
-    return 0;
-}
-
-int bm_is_allocated(const BlockManager *bm, int block_index) {
-    if (bm == NULL ||
-        block_index < 0 ||
-        block_index >= bm->total_blocks) return -1;
-    int x, y;
-    block_to_coord(bm, block_index, &x, &y);
-    return pbm_get_pixel(bm->image, x, y);
+uint32_t bm_checksum(const BlockManager *bm) {
+    uint32_t sum = 0xDEADBEEF; // Valor inicial único
+    for (int i = 0; i < bm->block_count; ++i) {
+        int val = bm_is_allocated(bm, i);
+        if (val < 0) continue;
+        sum ^= (uint32_t)val + i;
+    }
+    return sum;
 }

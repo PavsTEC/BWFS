@@ -2,42 +2,42 @@
 #define DIRECTORY_H
 
 #include <stdint.h>
-#include "pbm_manager.h"
-
-#define DIR_NAME_MAX 28
+#include "superblock.h"  // Usar constantes de aquí
 
 typedef struct {
-    uint32_t inode;               // Índice de i-nodo
-    char     name[DIR_NAME_MAX];  // Nombre (no termina en ‘\0’ necesariamente si ocupa todo)
+    char name[BWFS_FILENAME_MAXLEN];
+    uint32_t size;
+    uint32_t checksum;
+    uint32_t blocks[BWFS_MAX_BLOCKS_PER_FILE];
+    uint32_t block_count;
+    uint8_t used;
 } DirEntry;
 
-/**
- * Inicializa la gestión de directorios.
- * - image:               la PBM donde se almacenan las tablas de directorio.
- * - dir_region_offset:   bloque donde empieza la región de directorio.
- * - max_entries:         cuántas entradas caben.
- */
-void dir_init(PBMImage *image, int dir_region_offset, int max_entries);
+typedef struct {
+    DirEntry entries[BWFS_MAX_FILES];
+} Directory;
 
-/**
- * Agrega una entrada con (name → inode). Devuelve 0 en éxito, -1 en error o lleno.
- */
-int dir_add(const char *name, uint32_t inode);
+// Inicializa (memset 0)
+void dir_init(Directory *dir);
 
-/**
- * Elimina la entrada con ese name. Devuelve 0 en éxito, -1 si no existe.
- */
-int dir_remove(const char *name);
+// Busca archivo por nombre, retorna índice o -1
+int dir_find(const Directory *dir, const char *name);
 
-/**
- * Busca name y devuelve su inode, o -1 si no lo encuentra.
- */
-int dir_lookup(const char *name);
+// Crea nuevo archivo, retorna índice o -1
+int dir_create(Directory *dir, const char *name);
 
-/**
- * Lista todas las entradas: llena `names[i]` y `inodes[i]` hasta `max_count`.
- * Retorna el número de entradas encontradas.
- */
-int dir_list(char names[][DIR_NAME_MAX], uint32_t inodes[], int max_count);
+// Elimina archivo por nombre, retorna 0 o -1
+int dir_remove(Directory *dir, const char *name);
 
-#endif // DIRECTORY_H
+// Lee DirEntry por índice
+const DirEntry *dir_entry(const Directory *dir, int idx);
+DirEntry       *dir_entry_mut(Directory *dir, int idx);
+
+// Serializa y deserializa la tabla de archivos (a bits)
+void dir_serialize(const Directory *dir, uint8_t *out);
+void dir_deserialize(Directory *dir, const uint8_t *in);
+
+// Calcula checksum XOR de todos los bytes de la tabla de archivos
+uint32_t dir_checksum(const Directory *dir);
+
+#endif

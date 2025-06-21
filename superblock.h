@@ -1,29 +1,33 @@
 #ifndef SUPERBLOCK_H
 #define SUPERBLOCK_H
 
-#include <stdint.h>
 #include "pbm_manager.h"
+#include <stdint.h>
 
-// Tamaño reservado para el superbloque: usamos un bloque de 4 KB (4096 bytes),
-// asumiendo que image tiene al menos 4096 píxeles reservados para él.
-#define SUPERBLOCK_SIZE 4096
+// Definiciones únicas
+#define BWFS_MAGIC 0x42574653u  // 'BWFS'
+#define BWFS_MAX_FILES 128
+#define BWFS_MAX_BLOCKS_PER_FILE 32
+#define BWFS_FILENAME_MAXLEN 32
 
 typedef struct {
-    uint32_t magic;          // Constante identificadora, p.ej. 0xBWF5
-    uint32_t version;        // Versión del FS
-    uint64_t total_blocks;   // Bloques totales en todos los segmentos
-    uint32_t block_size;     // Tamaño en bytes de cada bloque (4096)
-    uint32_t segment_count;  // Cuántas imágenes forman el FS
-    // (El struct ocupa menos de SUPERBLOCK_SIZE bytes; el resto queda sin usar)
+    uint32_t magic;
+    uint32_t width;
+    uint32_t height;
+    uint32_t block_size;
+    uint32_t block_count;
+    uint32_t max_files;
+    uint32_t max_blocks_per_file;
+    uint32_t bitmap_offset;
+    uint32_t dir_offset;
+    uint32_t data_offset;
+    uint32_t checksum;
 } Superblock;
 
-// Serializa y guarda el superbloque en la imagen (bloque 0). Retorna 0 en éxito.
-int sb_save(PBMImage *image, const Superblock *sb, const char *passphrase);
+uint32_t sb_checksum(const Superblock *sb);
+void sb_init(Superblock *sb, int width, int height, int block_size,
+             int block_count, int max_files, int max_blocks_per_file);
+int sb_save(const Superblock *sb, PBMImage *img);
+int sb_load(Superblock *sb, const PBMImage *img);
 
-// Carga y deserializa el superbloque desde la imagen (bloque 0). Retorna NULL en error.
-Superblock *sb_load(PBMImage *image, const char *passphrase);
-
-// Libera la estructura Superblock* retornada por sb_load
-void sb_free(Superblock *sb);
-
-#endif // SUPERBLOCK_H
+#endif

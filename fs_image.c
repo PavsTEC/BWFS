@@ -81,58 +81,59 @@ void fs_add_image(FSImage *fs, int width, int height) {
     // (Por simplicidad, se asume que el superbloque se actualiza en fs_save)
 }
 
-FSImage *fs_load(const char *folder_path) {
-    FSImage *fs = calloc(1, sizeof(FSImage));
+FSImage *fs_load(const char *folder) {
+    // 1) Reserva y limpia FSImage
+    FSImage *fs = calloc(1, sizeof(*fs));
     if (!fs) return NULL;
 
-    // Cargar la primera imagen (implementación simplificada)
-    char first_image_path[256];
-    snprintf(first_image_path, sizeof(first_image_path), "%s/image_0.pbm", folder_path);
-    PBMImage *first_img = pbm_load(first_image_path);
-    if (!first_img) { 
-        free(fs); 
-        return NULL; 
+    // 2) Carga la primera imagen (image_0.pbm)
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/image_0.pbm", folder);
+    PBMImage *img0 = pbm_load(path);
+    if (!img0) {
+        free(fs);
+        return NULL;
     }
 
-    fs->images = malloc(sizeof(PBMImage *));
-    fs->images[0] = first_img;
+    // 3) Inicializa el array de imágenes
+    fs->images      = malloc(sizeof(*fs->images));
+    fs->images[0]   = img0;
     fs->image_count = 1;
 
-    // Cargar el superbloque
-    if (sb_load(&fs->sb, first_img) != 0) {
-        pbm_free(first_img);
-        free(fs->images);
-        free(fs);
-        return NULL;
+    // 4) Carga superbloque desde image_0
+    if (sb_load(&fs->sb, img0) < 0) {
+        // error
     }
 
-    // Verificar la firma
-    if (fs->sb.signature != BWFS_SIGNATURE) {
-        pbm_free(first_img);
-        free(fs->images);
-        free(fs);
-        return NULL;
-    }
-
-    // Inicializar bitmap y directorio
-    bm_init(&fs->bm, first_img, fs->sb.bitmap_offset, fs->sb.block_count);
-
-    // Lectura optimizada del directorio
-    uint8_t dir_bytes[sizeof(Directory)] = {0};
-    int dir_start = fs->sb.dir_offset;
-    for (size_t i = 0; i < sizeof(Directory) * 8; ++i) {
-        int x = (dir_start + i) % first_img->width;
-        int y = (dir_start + i) / first_img->width;
-        int bit = pbm_get_pixel(first_img, x, y);
-        if (bit < 0) {
-            pbm_free(first_img);
-            free(fs->images);
-            free(fs);
-            return NULL;
-        }
-        dir_bytes[i / 8] |= (bit << (7 - (i % 8)));
+    // 5) Deserializa el directorio leyendo bits de image_0
+    size_t bits_len  = sizeof(Directory) * 8;
+    uint8_t *dir_bytes = calloc(sizeof(Directory), 1);
+    for (size_t i = 0; i < bits_len; i++) {
+        size_t bit_idx = fs->sb.dir_offset + i;
+        int x = bit_idx % img0->width;
+        int y = bit_idx / img0->width;
+        int v = pbm_get_pixel(img0, x, y);
+        dir_bytes[i/8] |= (uint8_t)((v & 1) << (7 - (i % 8)));
     }
     dir_deserialize(&fs->dir, dir_bytes);
+    free(dir_bytes);
+
+    // 6) Carga imágenes adicionales (image_1.pbm, image_2.pbm, …)
+    for (int i = 1; ; i++) {
+        snprintf(path, sizeof(path), "%s/image_%d.pbm", folder, i);
+        PBMImage *img = pbm_load(path);
+        if (!img) break;
+        fs->images = realloc(fs->images,
+                             sizeof(*fs->images) * (fs->image_count + 1));
+        fs->images[fs->image_count++] = img;
+    }
+
+    // 7) Inicializa el bitmap sobre la última imagen cargada
+    PBMImage *last = fs->images[fs->image_count - 1];
+    bm_init(&fs->bm,
+            last,
+            fs->sb.bitmap_offset,
+            fs->sb.block_count);
 
     return fs;
 }
@@ -203,149 +204,177 @@ int fs_remove_file(FSImage *fs, const char *name) {
     return dir_remove(&fs->dir, name);
 }
 
-ssize_t fs_write_file(FSImage *fs, const char *name, const void *buf, size_t count) {
-    int idx = dir_find(&fs->dir, name);
+ssize_t fs_write_file(FSImage *fs,
+                      const char *filename,
+                      const void *buf,
+                      size_t size)
+{
+    const uint8_t *buffer = (const uint8_t *)buf;
+
+    // 1) Busca la entrada en el directorio
+    int idx = dir_find(&fs->dir, filename);
     if (idx < 0) return -1;
     DirEntry *e = dir_entry_mut(&fs->dir, idx);
 
-    int block_bytes = fs->sb.block_size / 8;
-    int blocks_needed = (count + block_bytes - 1) / block_bytes;
-    if (blocks_needed > BWFS_MAX_BLOCKS_PER_FILE || blocks_needed < 0) {
-        return -2;
-    }
+    // 2) Comprueba tamaño máximo permitido
+    size_t max_bytes = fs->sb.max_blocks_per_file * (fs->sb.block_size / 8);
+    if (size > max_bytes) return -1;
 
-    // Rollback en caso de error
-    for (uint32_t i = 0; i < e->block_count; ++i)
-        bm_free(&fs->bm, e->blocks[i]);
+    // 3) Libera bloques previos del archivo (si existían)
+    for (uint32_t i = 0; i < e->block_count; i++) {
+        int g = e->blocks[i];
+        int img = g / fs->sb.block_count;
+        uint32_t loc = g % fs->sb.block_count;
+        BlockManager bm_tmp;
+        bm_init(&bm_tmp,
+                fs->images[img],
+                fs->sb.bitmap_offset,
+                fs->sb.block_count);
+        bm_free(&bm_tmp, loc);
+    }
     e->block_count = 0;
-    e->size = count;
 
-    const uint8_t *data = buf;
-    size_t left = count;
-    int allocated_blocks[BWFS_MAX_BLOCKS_PER_FILE];
-    int alloc_count = 0;
+    // 4) Escribe los datos, bloque a bloque, expandiendo imágenes si es necesario
+    size_t written     = 0;
+    size_t block_bytes = fs->sb.block_size / 8;
 
-    for (int i = 0; i < blocks_needed; ++i) {
-        int b = bm_alloc_first(&fs->bm);
-        if (b < 0) {
-            // Rollback de bloques asignados
-            for (int j = 0; j < alloc_count; j++)
-                bm_free(&fs->bm, allocated_blocks[j]);
-            return -3;
+    while (written < size) {
+        size_t to_write = (size - written < block_bytes)
+                            ? size - written
+                            : block_bytes;
+
+        // 4.1) Intenta asignar en la imagen actual
+        int loc = bm_alloc_first(&fs->bm);
+        if (loc < 0) {
+            // Crea y usa una nueva imagen
+            PBMImage *new_img = pbm_create(fs->sb.width, fs->sb.height);
+            fs->images = realloc(fs->images,
+                                 sizeof(*fs->images) * (fs->image_count + 1));
+            fs->images[fs->image_count] = new_img;
+            fs->image_count++;
+
+            bm_init(&fs->bm,
+                    new_img,
+                    fs->sb.bitmap_offset,
+                    fs->sb.block_count);
+            loc = bm_alloc_first(&fs->bm);
+            if (loc < 0) {
+                // Ya no queda espacio incluso tras expandir
+                return -3;
+            }
         }
-        allocated_blocks[alloc_count++] = b;
-        e->blocks[i] = b;
-        e->block_count++;
 
-        int block_start = fs->sb.data_offset + b * fs->sb.block_size;
-        size_t to_write = left < (size_t)block_bytes ? left : (size_t)block_bytes;
+        // 4.2) Guarda el índice global de bloque
+        int img_idx      = fs->image_count - 1;
+        int global_block = img_idx * (int)fs->sb.block_count + loc;
+        e->blocks[e->block_count++] = global_block;
 
-        // Determinar en qué imagen está el bloque
-        int image_idx = block_start / (fs->images[0]->width * fs->images[0]->height);
-        if (image_idx >= fs->image_count) {
-            // Crear nueva imagen si es necesario
-            fs_add_image(fs, 1000, 1000);
+        // 4.3) Pintar bits en la PBM correspondiente
+        PBMImage *img = fs->images[img_idx];
+        size_t data_off = fs->sb.data_offset;
+        for (size_t bit = 0; bit < to_write * 8; bit++) {
+            size_t bit_idx = data_off
+                           + (size_t)loc * fs->sb.block_size
+                           + bit;
+            int x = bit_idx % img->width;
+            int y = bit_idx / img->width;
+            size_t byte_i = written + (bit / 8);
+            int bit_i = 7 - (bit % 8);
+            int val = (buffer[byte_i] >> bit_i) & 1;
+            pbm_set_pixel(img, x, y, val);
         }
 
-        PBMImage *target_img = fs->images[image_idx];
-        int img_offset = block_start % (target_img->width * target_img->height);
-
-        for (size_t j = 0; j < to_write * 8; ++j) {
-            int x = (img_offset + j) % target_img->width;
-            int y = (img_offset + j) / target_img->width;
-            int bit = (data[j/8] >> (7 - (j % 8))) & 1;
-            pbm_set_pixel(target_img, x, y, bit);
-        }
-        left -= to_write;
-        data += to_write;
+        written += to_write;
     }
 
-    // Checksum de datos
-    uint32_t sum = 0;
-    for (size_t i = 0; i < count; ++i)
-        sum ^= ((const uint8_t*)buf)[i];
-    e->checksum = sum;
-    return count;
+    // 5) Actualiza tamaño y checksum del archivo
+    e->size = size;
+    uint32_t file_sum = 0;
+    for (size_t i = 0; i < size; i++) {
+        file_sum ^= buffer[i];
+    }
+    e->checksum = file_sum;
+
+    // 6) Actualiza checksum del directorio y superbloque
+    fs_update_checksums(fs);
+
+    return (ssize_t)written;
 }
 
-ssize_t fs_read_file(FSImage *fs, const char *name, void *buf, size_t count) {
-    int idx = dir_find(&fs->dir, name);
-    if (idx < 0) {
-        printf("File not found: %s\n", name);
-        return -1;
-    }
+
+ssize_t fs_read_file(FSImage *fs,
+                     const char *filename,
+                     void *buf,
+                     size_t size)
+{
+    // 1) Busca la entrada
+    int idx = dir_find(&fs->dir, filename);
+    if (idx < 0) return -1;
     DirEntry *e = dir_entry_mut(&fs->dir, idx);
 
-    size_t to_read = count < e->size ? count : e->size;
-    if (to_read == 0) return 0;
+    // 2) No leer más de lo que pide el usuario
+    size_t to_read_total = (size < e->size) ? size : e->size;
+    uint8_t *buffer = (uint8_t *)buf;
+    memset(buffer, 0, to_read_total);
 
-    uint8_t *data = buf;
-    memset(buf, 0, count);
+    // 3) Parámetros
+    size_t block_bytes = fs->sb.block_size / 8;
+    size_t read_bytes  = 0;
 
-    size_t pos = 0;
-    int block_bytes = fs->sb.block_size / 8;
+    // 4) Recorre cada bloque asignado
+    for (uint32_t i = 0; i < e->block_count && read_bytes < to_read_total; i++) {
+        int g = e->blocks[i];
+        int img_idx = g / fs->sb.block_count;
+        uint32_t loc = g % fs->sb.block_count;
 
-    for (uint32_t i = 0; i < e->block_count && pos < to_read; ++i) {
-        int b = e->blocks[i];
-        int block_start = fs->sb.data_offset + b * fs->sb.block_size;
-
-        // Determinar en qué imagen está el bloque
-        int image_idx = block_start / (fs->images[0]->width * fs->images[0]->height);
-        if (image_idx >= fs->image_count) {
-            printf("Block %d out of image range\n", b);
+        // Validación simple
+        if (img_idx < 0 || img_idx >= fs->image_count) {
+            printf("Invalid image index %d in file '%s'\n",
+                   img_idx, e->name);
             return -2;
         }
 
-        PBMImage *target_img = fs->images[image_idx];
-        int img_offset = block_start % (target_img->width * target_img->height);
+        PBMImage *img = fs->images[img_idx];
+        size_t data_off = fs->sb.data_offset;
+        size_t this_read = (to_read_total - read_bytes < block_bytes)
+                             ? (to_read_total - read_bytes)
+                             : block_bytes;
 
-        size_t read_now = (to_read - pos) < (size_t)block_bytes ? 
-                         (to_read - pos) : (size_t)block_bytes;
-
-        for (size_t j = 0; j < read_now * 8; ++j) {
-            int x = (img_offset + j) % target_img->width;
-            int y = (img_offset + j) / target_img->width;
-            int bit = pbm_get_pixel(target_img, x, y);
-            if (bit < 0) {
+        // 5) Bit a bit desde la imagen PBM
+        for (size_t bit = 0; bit < this_read * 8; bit++) {
+            size_t bit_idx = data_off
+                           + (size_t)loc * fs->sb.block_size
+                           + bit;
+            int x = bit_idx % img->width;
+            int y = bit_idx / img->width;
+            int v = pbm_get_pixel(img, x, y);
+            if (v < 0) {
                 printf("Error reading bit at (%d,%d)\n", x, y);
                 return -2;
             }
-            if (bit) {
-                data[pos + j/8] |= (1 << (7 - (j % 8)));
-            }
+            size_t byte_i = read_bytes + (bit / 8);
+            int bit_i = 7 - (bit % 8);
+            buffer[byte_i] |= (v << bit_i);
         }
-        pos += read_now;
+
+        read_bytes += this_read;
     }
 
-    // Verificar checksum
-    uint32_t sum = 0;
-    for (size_t i = 0; i < to_read; ++i) {
-        sum ^= data[i];
-    }
-
-    if (sum != e->checksum) {
-        printf("Checksum mismatch for '%s': expected %u, got %u\n",
-               name, e->checksum, sum);
-        return -3;
-    }
-    return (ssize_t)to_read;
+    return (ssize_t)read_bytes;
 }
 
 int fs_check_integrity(FSImage *fs) {
     // 1. Verificar superbloque
     uint32_t stored_sb_checksum = fs->sb.checksum;
-    
-    // Crear copia temporal para cálculo
-    Superblock temp_sb = fs->sb;
-    temp_sb.checksum = 0;
-    uint32_t computed_sb_checksum = sb_checksum(&temp_sb);
-    
+    Superblock tmp_sb = fs->sb;
+    tmp_sb.checksum = 0;
+    uint32_t computed_sb_checksum = sb_checksum(&tmp_sb);
     if (computed_sb_checksum != stored_sb_checksum) {
         printf("Superblock checksum failed: stored=%u, computed=%u\n",
                stored_sb_checksum, computed_sb_checksum);
         return -1;
     }
-    
+
     // 2. Verificar checksum del directorio
     uint32_t computed_dir_sum = dir_checksum(&fs->dir);
     if (computed_dir_sum != fs->sb.dir_checksum) {
@@ -354,71 +383,82 @@ int fs_check_integrity(FSImage *fs) {
         return -2;
     }
 
-    // 3. Verificar bitmap (consistencia global)
+    // 3. Contar bloques asignados en todas las imágenes
     uint32_t allocated_blocks = 0;
-    for (uint32_t i = 0; i < fs->sb.block_count; i++) {
-        if (bm_is_allocated(&fs->bm, i)) allocated_blocks++;
-    }
-    
-    // 4. Verificar archivos individualmente
-    for (int i = 0; i < BWFS_MAX_FILES; ++i) {
-        if (fs->dir.entries[i].used) {
-            // Verificar que los bloques asignados son válidos
-            for (uint32_t j = 0; j < fs->dir.entries[i].block_count; j++) {
-                int block_idx = fs->dir.entries[i].blocks[j];
-                if (block_idx < 0 || block_idx >= (int)fs->sb.block_count) {
-                    printf("Invalid block %d in file '%s'\n", 
-                           block_idx, fs->dir.entries[i].name);
-                    return -10 - i;
-                }
-                if (bm_is_allocated(&fs->bm, block_idx) != 1) {
-                    printf("Block %d not allocated for file '%s'\n", 
-                           block_idx, fs->dir.entries[i].name);
-                    return -20 - i;
-                }
-            }
-            
-            // Leer el archivo
-            uint8_t *tmp = malloc(fs->dir.entries[i].size);
-            if (!tmp) return -30;
-            
-            ssize_t read = fs_read_file(fs, fs->dir.entries[i].name, 
-                                       tmp, fs->dir.entries[i].size);
-            if (read < 0) {
-                printf("Read failed for '%s': %zd\n", 
-                      fs->dir.entries[i].name, read);
-                free(tmp);
-                return -40 - i;
-            }
-            
-            // Calcular checksum
-            uint32_t sum = 0;
-            for (size_t j = 0; j < fs->dir.entries[i].size; j++) {
-                sum ^= tmp[j];
-            }
-            free(tmp);
-            
-            if (sum != fs->dir.entries[i].checksum) {
-                printf("Checksum mismatch for '%s': expected %u, got %u\n", 
-                      fs->dir.entries[i].name, fs->dir.entries[i].checksum, sum);
-                return -50 - i;
+    for (int img = 0; img < fs->image_count; img++) {
+        BlockManager bm_tmp;
+        bm_init(&bm_tmp,
+                fs->images[img],
+                fs->sb.bitmap_offset,
+                fs->sb.block_count);
+        for (uint32_t b = 0; b < fs->sb.block_count; b++) {
+            if (bm_is_allocated(&bm_tmp, b) == 1) {
+                allocated_blocks++;
             }
         }
     }
-    
-    // 5. Verificar que no hay bloques asignados de más
+
+    // 4. Verificar cada archivo
+    int total_blocks = fs->image_count * fs->sb.block_count;
+    for (int i = 0; i < BWFS_MAX_FILES; i++) {
+        DirEntry *e = &fs->dir.entries[i];
+        if (!e->used) continue;
+
+        // 4a) Verificar que todos los bloques globales son válidos y estén marcados
+        for (uint32_t j = 0; j < e->block_count; j++) {
+            int g = e->blocks[j];
+            if (g < 0 || g >= total_blocks) {
+                printf("Invalid global block %d in file '%s'\n",
+                       g, e->name);
+                return -10 - i;
+            }
+            int img = g / fs->sb.block_count;
+            int loc = g % fs->sb.block_count;
+            BlockManager bm_tmp;
+            bm_init(&bm_tmp,
+                    fs->images[img],
+                    fs->sb.bitmap_offset,
+                    fs->sb.block_count);
+            if (bm_is_allocated(&bm_tmp, loc) != 1) {
+                printf("Block %d not allocated for file '%s'\n",
+                       g, e->name);
+                return -20 - i;
+            }
+        }
+
+        // 4b) Leer y verificar checksum del contenido
+        uint8_t *buf = malloc(e->size);
+        if (!buf) return -30;
+        ssize_t rd = fs_read_file(fs, e->name, buf, e->size);
+        if (rd < 0) {
+            printf("Read failed for '%s': %zd\n", e->name, rd);
+            free(buf);
+            return -40 - i;
+        }
+        uint32_t sum = 0;
+        for (size_t k = 0; k < e->size; k++) {
+            sum ^= buf[k];
+        }
+        free(buf);
+        if (sum != e->checksum) {
+            printf("Checksum mismatch for '%s': expected %u, got %u\n",
+                   e->name, e->checksum, sum);
+            return -50 - i;
+        }
+    }
+
+    // 5. Verificar que el número de bloques marcados coincide con la suma de e->block_count
     uint32_t files_blocks = 0;
     for (int i = 0; i < BWFS_MAX_FILES; i++) {
         if (fs->dir.entries[i].used) {
             files_blocks += fs->dir.entries[i].block_count;
         }
     }
-    
     if (allocated_blocks != files_blocks) {
         printf("Block count mismatch: bitmap=%u, files=%u\n",
                allocated_blocks, files_blocks);
         return -3;
     }
-    
+
     return 0;
 }

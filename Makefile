@@ -1,9 +1,9 @@
 CC       = gcc
 CFLAGS   = -std=c11 -Wall -Wextra -O2 -I.
 
-# Flags para FUSE (ajusta si usas fuse3 u otro)
-FUSE_CFLAGS := $(shell pkg-config fuse --cflags)
-FUSE_LIBS   := $(shell pkg-config fuse --libs)
+# Flags para FUSE 3
+FUSE_CFLAGS := $(shell pkg-config fuse3 --cflags)
+FUSE_LIBS   := $(shell pkg-config fuse3 --libs)
 
 # Módulos core del FS
 MODULES = pbm_manager block_manager superblock directory fs_image
@@ -15,15 +15,29 @@ TEST_OBJS := $(TEST_SRCS:.c=.o)
 
 .PHONY: all test clean
 
-all: bwfs_fuse
+# Por defecto compila mkfs.bwfs, fsck.bwfs y mount.bwfs
+all: mkfs.bwfs fsck.bwfs mount.bwfs
 
 # Librería estática
 libbwfs.a: $(OBJS)
 	ar rcs $@ $^
 
-# Regla genérica para compilar .c → .o (incluye test/*.c)
+# Regla genérica para compilar .c → .o (incluye test/*.c y mount.bwfs.c)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# mkfs.bwfs
+mkfs.bwfs: mkfs.bwfs.o libbwfs.a
+	$(CC) $(CFLAGS) -o $@ mkfs.bwfs.o -L. -lbwfs
+
+# fsck.bwfs
+fsck.bwfs: fsck.bwfs.o libbwfs.a
+	$(CC) $(CFLAGS) -o $@ fsck.bwfs.o -L. -lbwfs
+
+# mount.bwfs (FUSE)
+mount.bwfs: mount.bwfs.o libbwfs.a
+	$(CC) $(CFLAGS) $(FUSE_CFLAGS) -o $@ mount.bwfs.o \
+	    -L. -lbwfs $(FUSE_LIBS)
 
 # Pruebas
 test: test_bwfs
@@ -35,4 +49,6 @@ test_bwfs: libbwfs.a $(TEST_OBJS)
 
 # Limpieza
 clean:
-	rm -f $(OBJS) bwfs_fuse.o $(TEST_OBJS) libbwfs.a bwfs_fuse test_bwfs test.pbm
+	rm -f $(OBJS) mkfs.bwfs.o fsck.bwfs.o mount.bwfs.o \
+	      libbwfs.a mkfs.bwfs fsck.bwfs mount.bwfs \
+	      test_bwfs $(TEST_OBJS) test.pbm

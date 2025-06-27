@@ -1,3 +1,6 @@
+#define _XOPEN_SOURCE 700
+#include <errno.h>
+#include <sys/statvfs.h>
 #include "fs_image.h"
 #include <stdlib.h>
 #include <string.h>
@@ -82,44 +85,46 @@ void fs_add_image(FSImage *fs, int width, int height) {
 }
 
 FSImage *fs_load(const char *folder) {
-    // 1) Reserva y limpia FSImage
+    // 1) Crear y cargar image_0
     FSImage *fs = calloc(1, sizeof(*fs));
     if (!fs) return NULL;
-
-    // 2) Carga la primera imagen (image_0.pbm)
     char path[1024];
     snprintf(path, sizeof(path), "%s/image_0.pbm", folder);
     PBMImage *img0 = pbm_load(path);
-    if (!img0) {
-        free(fs);
-        return NULL;
-    }
+    if (!img0) { free(fs); return NULL; }
 
-    // 3) Inicializa el array de imágenes
+    // 2) Inicializar array de imágenes
     fs->images      = malloc(sizeof(*fs->images));
     fs->images[0]   = img0;
     fs->image_count = 1;
 
-    // 4) Carga superbloque desde image_0
+    // 3) Cargar superbloque
     if (sb_load(&fs->sb, img0) < 0) {
-        // error
+        free(fs);
+        return NULL;
     }
 
-    // 5) Deserializa el directorio leyendo bits de image_0
-    size_t bits_len  = sizeof(Directory) * 8;
-    uint8_t *dir_bytes = calloc(sizeof(Directory), 1);
-    for (size_t i = 0; i < bits_len; i++) {
+    // 4) Deserializar sólo entries[] de directorio
+    size_t entry_count = BWFS_MAX_FILES;
+    size_t entry_size  = sizeof(DirEntry) * entry_count;
+    uint8_t *dir_bytes = calloc(1, entry_size);
+    if (!dir_bytes) { free(fs); return NULL; }
+    size_t d_bits = entry_size * 8;
+
+    for (size_t i = 0; i < d_bits; ++i) {
         size_t bit_idx = fs->sb.dir_offset + i;
         int x = bit_idx % img0->width;
         int y = bit_idx / img0->width;
         int v = pbm_get_pixel(img0, x, y);
-        dir_bytes[i/8] |= (uint8_t)((v & 1) << (7 - (i % 8)));
+        dir_bytes[i/8] |= (uint8_t)((v & 1) << (7 - (i%8)));
     }
-    dir_deserialize(&fs->dir, dir_bytes);
+    // Copiamos sólo entries[] y restablecemos max_entries
+    memcpy(fs->dir.entries, dir_bytes, entry_size);
+    fs->dir.max_entries = BWFS_MAX_FILES;
     free(dir_bytes);
 
-    // 6) Carga imágenes adicionales (image_1.pbm, image_2.pbm, …)
-    for (int i = 1; ; i++) {
+    // 5) Cargar imágenes adicionales (image_1.pbm, image_2.pbm, …)
+    for (int i = 1; ; ++i) {
         snprintf(path, sizeof(path), "%s/image_%d.pbm", folder, i);
         PBMImage *img = pbm_load(path);
         if (!img) break;
@@ -128,8 +133,8 @@ FSImage *fs_load(const char *folder) {
         fs->images[fs->image_count++] = img;
     }
 
-    // 7) Inicializa el bitmap sobre la última imagen cargada
-    PBMImage *last = fs->images[fs->image_count - 1];
+    // 6) Inicializar bitmap sobre la última imagen
+    PBMImage *last = fs->images[fs->image_count-1];
     bm_init(&fs->bm,
             last,
             fs->sb.bitmap_offset,
@@ -148,34 +153,41 @@ void fs_update_checksums(FSImage *fs) {
 }
 
 int fs_save(FSImage *fs, const char *folder_path) {
-    // Actualizar checksums antes de guardar
+    // 1) Actualizar todos los checksums
     fs_update_checksums(fs);
-    
-    // Guardar superbloque primero
+
+    // 2) Guardar superbloque en la primera imagen
     sb_save(&fs->sb, fs->images[0]);
 
-    // Serializar y guardar el directorio en la primera imagen
-    uint8_t dir_bytes[sizeof(Directory)] = {0};
-    dir_serialize(&fs->dir, dir_bytes);
-    int dir_start = fs->sb.dir_offset;
-    for (size_t i = 0; i < sizeof(Directory) * 8; ++i) {
-        int x = (dir_start + i) % fs->images[0]->width;
-        int y = (dir_start + i) / fs->images[0]->width;
-        int bit = (dir_bytes[i / 8] >> (7 - (i % 8))) & 1;
-        pbm_set_pixel(fs->images[0], x, y, bit);
-    }
+    // 3) Serializar únicamente las entradas de directorio
+    size_t entry_count = BWFS_MAX_FILES;
+    size_t entry_size  = sizeof(DirEntry) * entry_count;
+    uint8_t *dir_bytes = calloc(1, entry_size);
+    if (!dir_bytes) return -1;
+    // Copiamos sólo entries[], no max_entries
+    memcpy(dir_bytes, fs->dir.entries, entry_size);
 
-    // Guardar todas las imágenes
+    // 4) Pintar bits de directorio en image_0
+    size_t d_bits = entry_size * 8;
+    PBMImage *img0 = fs->images[0];
+    int dir_start = fs->sb.dir_offset;
+    for (size_t i = 0; i < d_bits; ++i) {
+        int x = (dir_start + i) % img0->width;
+        int y = (dir_start + i) / img0->width;
+        int bit = (dir_bytes[i/8] >> (7 - (i%8))) & 1;
+        pbm_set_pixel(img0, x, y, bit);
+    }
+    free(dir_bytes);
+
+    // 5) Guardar todas las imágenes en disco
     for (int i = 0; i < fs->image_count; ++i) {
-        char file_path[256];
-        snprintf(file_path, sizeof(file_path), "%s/image_%d.pbm", folder_path, i);
-        printf("Guardando imagen %d en %s\n", i, file_path);
-        if (pbm_save(fs->images[i], file_path) != 0) {
-            printf("Error al guardar la imagen %d\n", i);
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/image_%d.pbm", folder_path, i);
+        if (pbm_save(fs->images[i], path) != 0) {
+            fprintf(stderr, "Error guardando %s\n", path);
             return -1;
         }
     }
-
     return 0;
 }
 
@@ -361,6 +373,61 @@ ssize_t fs_read_file(FSImage *fs,
     }
 
     return (ssize_t)read_bytes;
+}
+
+int fs_mkdir(FSImage *fs, const char *dirname) {
+    int rc = dir_mkdir(&fs->dir, dirname);
+    if (rc < 0) return -ENOSPC;
+    fs_update_checksums(fs);
+    return 0;
+}
+
+int fs_rmdir(FSImage *fs, const char *dirname) {
+    int rc = dir_remove(&fs->dir, dirname);
+    if (rc < 0) return -ENOENT;
+    fs_update_checksums(fs);
+    return 0;
+}
+
+int fs_rename(FSImage *fs, const char *oldname, const char *newname) {
+    int rc = dir_rename(&fs->dir, oldname, newname);
+    if (rc < 0) return -EEXIST;
+    fs_update_checksums(fs);
+    return 0;
+}
+
+int fs_access(FSImage *fs, const char *name, int mask) {
+    (void)mask;
+    return (dir_find(&fs->dir, name) >= 0) ? 0 : -ENOENT;
+}
+
+int fs_statfs(FSImage *fs, struct statvfs *st) {
+    size_t bsz = fs->sb.block_size / 8;
+    st->f_bsize   = bsz;
+    st->f_frsize  = bsz;
+    st->f_blocks  = fs->image_count * fs->sb.block_count;
+    // cuenta libres
+    uint32_t freeb = 0;
+    for (int i = 0; i < fs->image_count; i++) {
+        BlockManager bm_t;
+        bm_init(&bm_t,
+                fs->images[i],
+                fs->sb.bitmap_offset,
+                fs->sb.block_count);
+        for (uint32_t b = 0; b < fs->sb.block_count; b++)
+            if (!bm_is_allocated(&bm_t, b)) freeb++;
+    }
+    st->f_bfree  = freeb;
+    st->f_bavail = freeb;
+    st->f_files  = BWFS_MAX_FILES;
+    // ficheros libres en el directorio
+    int used = 0;
+    for (uint32_t i = 0; i < fs->dir.max_entries; i++)
+        if (fs->dir.entries[i].used) used++;
+    st->f_ffree  = BWFS_MAX_FILES - used;
+    st->f_favail = st->f_ffree;
+    st->f_namemax = BWFS_FILENAME_MAXLEN;
+    return 0;
 }
 
 int fs_check_integrity(FSImage *fs) {
